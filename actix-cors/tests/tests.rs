@@ -1,18 +1,40 @@
-use actix_cors::Cors;
+use actix_cors::{Cors, CorsServiceError};
 use actix_utils::future::ok;
 use actix_web::{
-    dev::{fn_service, ServiceRequest, Transform},
+    body::{self, BoxBody},
+    dev::{fn_service, ServiceRequest, ServiceResponse, Transform},
     http::{
         header::{self, HeaderValue},
         Method, StatusCode,
     },
     test::{self, TestRequest},
-    HttpResponse,
+    HttpResponse, ResponseError,
 };
 use regex::bytes::Regex;
 
 fn val_as_str(val: &HeaderValue) -> &str {
     val.to_str().unwrap()
+}
+
+#[derive(Debug)]
+struct CustomError;
+
+impl std::fmt::Display for CustomError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("custom error")
+    }
+}
+
+impl ResponseError for CustomError {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::UNAUTHORIZED
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::Unauthorized()
+            .insert_header((header::WWW_AUTHENTICATE, "Bearer"))
+            .body("custom error")
+    }
 }
 
 #[actix_web::test]
@@ -640,6 +662,153 @@ async fn expose_all_request_header_values() {
 
     assert!(cd_hdr.contains("content-disposition"));
     assert!(cd_hdr.contains("access-control-allow-origin"));
+}
+
+#[actix_web::test]
+async fn middleware_errors_receive_cors_headers() {
+    let cors = Cors::default()
+        .allowed_origin("https://www.example.com")
+        .supports_credentials()
+        .new_transform(fn_service(|_req: ServiceRequest| async {
+            Err::<ServiceResponse<BoxBody>, _>(CustomError.into())
+        }))
+        .await
+        .unwrap();
+
+    let req = TestRequest::default()
+        .insert_header((header::ORIGIN, "https://www.example.com"))
+        .to_srv_request();
+
+    let err = test::try_call_service(&cors, req)
+        .await
+        .expect_err("request should return an error");
+    let wrapped = err
+        .as_error::<CorsServiceError>()
+        .expect("error should be wrapped by CORS");
+    assert!(wrapped.as_error::<CustomError>().is_some());
+    let resp = err.error_response();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(val_as_str),
+        Some("https://www.example.com")
+    );
+    assert_eq!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .map(val_as_str),
+        Some("true")
+    );
+    assert_eq!(
+        resp.headers().get(header::WWW_AUTHENTICATE).map(val_as_str),
+        Some("Bearer")
+    );
+    assert_eq!(
+        resp.headers().get(header::VARY).map(val_as_str),
+        Some("Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+    );
+
+    let body = body::to_bytes(resp.into_body()).await.unwrap();
+    assert_eq!(std::str::from_utf8(&body).unwrap(), "custom error");
+}
+
+#[actix_web::test]
+async fn middleware_errors_without_origin_only_receive_vary() {
+    let cors = Cors::default()
+        .new_transform(fn_service(|_req: ServiceRequest| async {
+            Err::<ServiceResponse<BoxBody>, _>(actix_web::error::ErrorBadRequest("bad request"))
+        }))
+        .await
+        .unwrap();
+
+    let req = TestRequest::default().to_srv_request();
+
+    let err = test::try_call_service(&cors, req)
+        .await
+        .expect_err("request should return an error");
+    let resp = err.error_response();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        None
+    );
+    assert_eq!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+        None
+    );
+    assert_eq!(
+        resp.headers().get(header::VARY).map(val_as_str),
+        Some("Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+    );
+}
+
+#[actix_web::test]
+async fn middleware_errors_with_mismatched_origin_keep_non_origin_headers() {
+    let cors = Cors::default()
+        .allowed_origin("https://www.example.com")
+        .supports_credentials()
+        .block_on_origin_mismatch(false)
+        .new_transform(fn_service(|_req: ServiceRequest| async {
+            Err::<ServiceResponse<BoxBody>, _>(actix_web::error::ErrorBadRequest("bad request"))
+        }))
+        .await
+        .unwrap();
+
+    let req = TestRequest::default()
+        .insert_header((header::ORIGIN, "https://wrong.com"))
+        .to_srv_request();
+
+    let err = test::try_call_service(&cors, req)
+        .await
+        .expect_err("request should return an error");
+    let resp = err.error_response();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        None
+    );
+    assert_eq!(
+        resp.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .map(val_as_str),
+        Some("true")
+    );
+    assert_eq!(
+        resp.headers().get(header::VARY).map(val_as_str),
+        Some("Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+    );
+}
+
+#[actix_web::test]
+async fn middleware_errors_expose_response_headers_when_configured() {
+    let cors = Cors::permissive()
+        .new_transform(fn_service(|_req: ServiceRequest| async {
+            Err::<ServiceResponse<BoxBody>, _>(CustomError.into())
+        }))
+        .await
+        .unwrap();
+
+    let req = TestRequest::default()
+        .insert_header((header::ORIGIN, "https://www.example.com"))
+        .to_srv_request();
+
+    let err = test::try_call_service(&cors, req)
+        .await
+        .expect_err("request should return an error");
+    let resp = err.error_response();
+    let exposed = resp
+        .headers()
+        .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .map(val_as_str)
+        .unwrap();
+
+    assert!(exposed.contains("access-control-allow-origin"));
+    assert!(exposed.contains("www-authenticate"));
+    assert!(!exposed.contains("access-control-allow-credentials"));
 }
 
 #[cfg(feature = "draft-private-network-access")]

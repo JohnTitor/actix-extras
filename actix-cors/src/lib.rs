@@ -64,4 +64,8 @@ use crate::{
     all_or_some::AllOrSome,
     inner::{Inner, OriginFn},
 };
-pub use crate::{builder::Cors, error::CorsError, middleware::CorsMiddleware};
+pub use crate::{
+    builder::Cors,
+    error::CorsError,
+    middleware::{CorsMiddleware, CorsServiceError},
+};

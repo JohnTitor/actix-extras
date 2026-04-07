@@ -1,14 +1,14 @@
-use std::{collections::HashSet, rc::Rc};
+use std::{collections::HashSet, error::Error as StdError, fmt, rc::Rc};
 
 use actix_utils::future::ok;
 use actix_web::{
     body::{EitherBody, MessageBody},
-    dev::{forward_ready, Service, ServiceRequest, ServiceResponse},
+    dev::{forward_ready, RequestHead, Service, ServiceRequest, ServiceResponse},
     http::{
         header::{self, HeaderValue},
-        Method,
+        Method, StatusCode,
     },
-    Error, HttpResponse, Result,
+    Error, HttpResponse, ResponseError, Result,
 };
 use futures_util::future::{FutureExt as _, LocalBoxFuture};
 use log::debug;
@@ -28,6 +28,142 @@ use crate::{
 pub struct CorsMiddleware<S> {
     pub(crate) service: S,
     pub(crate) inner: Rc<Inner>,
+}
+
+#[derive(Debug)]
+struct CorsResponseContext {
+    allow_origin: Option<HeaderValue>,
+    expose_headers: Option<HeaderValue>,
+    expose_all_headers: bool,
+    supports_credentials: bool,
+    #[cfg(feature = "draft-private-network-access")]
+    should_allow_private_network: bool,
+    vary_header: bool,
+}
+
+impl CorsResponseContext {
+    fn from_request_head(inner: &Inner, req: &RequestHead, origin_allowed: bool) -> Self {
+        Self {
+            allow_origin: if origin_allowed {
+                inner.access_control_allow_origin(req)
+            } else {
+                None
+            },
+            expose_headers: inner.expose_headers_baked.clone(),
+            expose_all_headers: matches!(inner.expose_headers, AllOrSome::All),
+            supports_credentials: inner.supports_credentials,
+            #[cfg(feature = "draft-private-network-access")]
+            should_allow_private_network: inner.allow_private_network_access
+                && req
+                    .headers()
+                    .contains_key("access-control-request-private-network"),
+            vary_header: inner.vary_header,
+        }
+    }
+
+    fn apply(&self, headers: &mut header::HeaderMap) {
+        if let Some(ref origin) = self.allow_origin {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        }
+
+        if let Some(ref expose) = self.expose_headers {
+            log::trace!("exposing selected headers: {:?}", expose);
+
+            headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, expose.clone());
+        } else if self.expose_all_headers {
+            // intersperse_header_values requires that argument is non-empty
+            if !headers.is_empty() {
+                let expose_all_headers = headers
+                    .keys()
+                    .map(|name| name.as_str())
+                    .collect::<HashSet<_>>();
+
+                let expose_headers_value = intersperse_header_values(&expose_all_headers);
+
+                log::trace!(
+                    "exposing all headers from request: {:?}",
+                    expose_headers_value
+                );
+
+                headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, expose_headers_value);
+            }
+        }
+
+        if self.supports_credentials {
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                HeaderValue::from_static("true"),
+            );
+        }
+
+        #[cfg(feature = "draft-private-network-access")]
+        if self.should_allow_private_network {
+            headers.insert(
+                header::HeaderName::from_static("access-control-allow-private-network"),
+                HeaderValue::from_static("true"),
+            );
+        }
+
+        if self.vary_header {
+            add_vary_header(headers);
+        }
+    }
+
+    fn into_service_response<B>(self, mut res: ServiceResponse<B>) -> ServiceResponse<B> {
+        self.apply(res.headers_mut());
+        res
+    }
+}
+
+/// Error wrapper used when `Cors` adds CORS headers to a wrapped service error response.
+///
+/// This wrapper preserves the original error response body and status while allowing callers to
+/// recover the inner error through [`Self::as_error`] or [`Self::as_response_error`].
+#[derive(Debug)]
+pub struct CorsServiceError {
+    inner: Error,
+    context: CorsResponseContext,
+}
+
+impl CorsServiceError {
+    /// Returns the wrapped response error as a trait object.
+    pub fn as_response_error(&self) -> &dyn ResponseError {
+        self.inner.as_response_error()
+    }
+
+    /// Downcasts the wrapped response error.
+    pub fn as_error<T: ResponseError + 'static>(&self) -> Option<&T> {
+        self.inner.as_error()
+    }
+
+    /// Returns the wrapped Actix Web error.
+    pub fn into_inner(self) -> Error {
+        self.inner
+    }
+}
+
+impl fmt::Display for CorsServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl StdError for CorsServiceError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.inner)
+    }
+}
+
+impl ResponseError for CorsServiceError {
+    fn status_code(&self) -> StatusCode {
+        self.inner.as_response_error().status_code()
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        let mut res = self.inner.error_response();
+        self.context.apply(res.headers_mut());
+        res
+    }
 }
 
 impl<S> CorsMiddleware<S> {
@@ -124,74 +260,6 @@ impl<S> CorsMiddleware<S> {
 
         req.into_response(res)
     }
-
-    fn augment_response<B>(
-        inner: &Inner,
-        origin_allowed: bool,
-        mut res: ServiceResponse<B>,
-    ) -> ServiceResponse<B> {
-        if origin_allowed {
-            if let Some(origin) = inner.access_control_allow_origin(res.request().head()) {
-                res.headers_mut()
-                    .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-            };
-        }
-
-        if let Some(ref expose) = inner.expose_headers_baked {
-            log::trace!("exposing selected headers: {:?}", expose);
-
-            res.headers_mut()
-                .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, expose.clone());
-        } else if matches!(inner.expose_headers, AllOrSome::All) {
-            // intersperse_header_values requires that argument is non-empty
-            if !res.headers().is_empty() {
-                // extract header names from request
-                let expose_all_request_headers = res
-                    .headers()
-                    .keys()
-                    .map(|name| name.as_str())
-                    .collect::<HashSet<_>>();
-
-                // create comma separated string of header names
-                let expose_headers_value = intersperse_header_values(&expose_all_request_headers);
-
-                log::trace!(
-                    "exposing all headers from request: {:?}",
-                    expose_headers_value
-                );
-
-                // add header names to expose response header
-                res.headers_mut()
-                    .insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, expose_headers_value);
-            }
-        }
-
-        if inner.supports_credentials {
-            res.headers_mut().insert(
-                header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                HeaderValue::from_static("true"),
-            );
-        }
-
-        #[cfg(feature = "draft-private-network-access")]
-        if inner.allow_private_network_access
-            && res
-                .request()
-                .headers()
-                .contains_key("access-control-request-private-network")
-        {
-            res.headers_mut().insert(
-                header::HeaderName::from_static("access-control-allow-private-network"),
-                HeaderValue::from_static("true"),
-            );
-        }
-
-        if inner.vary_header {
-            add_vary_header(res.headers_mut());
-        }
-
-        res
-    }
 }
 
 impl<S, B> Service<ServiceRequest> for CorsMiddleware<S>
@@ -233,11 +301,25 @@ where
         };
 
         let inner = Rc::clone(&self.inner);
+        let error_context =
+            CorsResponseContext::from_request_head(&self.inner, req.head(), origin_allowed);
         let fut = self.service.call(req);
 
         Box::pin(async move {
-            let res = fut.await;
-            Ok(Self::augment_response(&inner, origin_allowed, res?).map_into_left_body())
+            match fut.await {
+                Ok(res) => Ok(CorsResponseContext::from_request_head(
+                    &inner,
+                    res.request().head(),
+                    origin_allowed,
+                )
+                .into_service_response(res)
+                .map_into_left_body()),
+                Err(err) => Err(CorsServiceError {
+                    inner: err,
+                    context: error_context,
+                }
+                .into()),
+            }
         })
     }
 }
